@@ -21,9 +21,6 @@ venv/
 env/
 .venv/
 
-# Test output
-test_results.csv
-
 # IDE
 .vscode/
 .idea/

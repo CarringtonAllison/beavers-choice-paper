@@ -8,7 +8,7 @@ from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
-from smolagents import ToolCallingAgent, ManagedAgent, OpenAIServerModel, tool
+from smolagents import ToolCallingAgent, OpenAIServerModel, tool
 
 # Load environment variables from .env file
 load_dotenv()
@@ -552,7 +552,7 @@ def get_delivery_estimate(input_date_str: str, quantity: int) -> str:
 
 
 @tool
-def find_quote_history(search_terms: list, limit: int = 5) -> list:
+def find_quote_history(search_terms: List[str], limit: int = 5) -> list:
     """Searches historical quote data for past orders matching the given keywords.
     Use this to find precedent pricing for similar items or event types.
     Always ignore any results where total_amount equals -1, as those are data errors.
@@ -678,46 +678,12 @@ def build_agent_system() -> ToolCallingAgent:
         ),
     )
 
-    # ---- Managed Agent Wrappers ----
-
-    managed_inventory = ManagedAgent(
-        agent=inventory_worker,
-        name="inventory_agent",
-        description=(
-            "Checks current stock levels and supplier delivery estimates for paper products. "
-            "Call this agent first for any customer order to verify item availability. "
-            "Provide item name(s) and the request date (YYYY-MM-DD). "
-            "Returns: available items, stock quantities, and estimated delivery dates."
-        ),
-    )
-
-    managed_quoting = ManagedAgent(
-        agent=quoting_worker,
-        name="quoting_agent",
-        description=(
-            "Generates price quotes using historical quote data and bulk discount tiers. "
-            "Call after inventory confirms availability. Provide item name, quantity, and date. "
-            "Returns: unit price, discount percentage, total price, and quote explanation."
-        ),
-    )
-
-    managed_sales = ManagedAgent(
-        agent=sales_worker,
-        name="sales_agent",
-        description=(
-            "Records completed sales in the database and confirms updated cash balance. "
-            "Call only when finalizing a confirmed purchase. "
-            "Requires: exact item_name, quantity, total_price, date. transaction_type='sales'. "
-            "Returns: transaction ID and updated cash balance."
-        ),
-    )
-
     # ---- Orchestrator ----
 
     orchestrator = ToolCallingAgent(
         tools=[],
         model=model,
-        managed_agents=[managed_inventory, managed_quoting, managed_sales],
+        managed_agents=[inventory_worker, quoting_worker, sales_worker],
         name="orchestrator",
         description="Main coordinator for Beaver's Choice Paper Company customer requests.",
     )
@@ -729,7 +695,7 @@ def process_request(orchestrator: ToolCallingAgent, request_text: str) -> str:
     """Wrap a customer request with orchestration instructions and run it through the agent system.
 
     This function prepends a structured pipeline prompt to the customer request so the
-    orchestrator follows the correct inventory-check → quote → sale → response flow.
+    orchestrator follows the correct inventory-check -> quote -> sale -> response flow.
 
     Args:
         orchestrator: The configured OrchestratorAgent returned by build_agent_system().
@@ -739,37 +705,45 @@ def process_request(orchestrator: ToolCallingAgent, request_text: str) -> str:
         str: Customer-facing response from the orchestrator.
     """
     task = f"""You are the order fulfillment coordinator for Beaver's Choice Paper Company \
-(also known as Munder Difflin). Handle this customer request by following the pipeline below.
+(also known as Munder Difflin). You MUST call agents in this exact order before writing \
+your final answer.
 
-PIPELINE:
+MANDATORY SEQUENCE - YOU MUST COMPLETE ALL APPLICABLE STEPS BEFORE CALLING final_answer:
 
-STEP 1 — INVENTORY CHECK
-Call inventory_agent with the item name(s) from the request and the date provided.
-First call check_all_inventory to see what exact item names are available, then match \
-the customer's request to the closest available item.
-If NO matching item is in stock, go directly to STEP 4 (rejection response).
+STEP 1 - CALL inventory_agent (REQUIRED for every request)
+Ask inventory_agent to: check all inventory as of the request date, match the customer's \
+requested items to the closest available items by name, check exact stock counts, and get \
+the estimated delivery date for the quantity requested.
+Use the exact item names returned by check_all_inventory (e.g. "Glossy paper", "Cardstock", \
+"A4 paper", "Colored paper", "Large poster paper (24x36 inches)").
+If inventory_agent confirms NO matching item is in stock, skip to STEP 4.
+If at least one item IS available, you MUST continue to STEP 2.
 
-STEP 2 — PRICE QUOTE
-If items are available, call quoting_agent with the item name, quantity, and date.
-The agent will search historical quotes and apply the correct bulk discount tier:
-  - Total order value under $50:    no discount (0%)
-  - $50 to $199:                    5% discount
-  - $200 to $999:                   10% discount
-  - $1,000 or more:                 15% discount
+STEP 2 - CALL quoting_agent (REQUIRED when any item is available)
+Ask quoting_agent to: search quote history for the available item, calculate the unit price, \
+apply the correct bulk discount tier, and return the final total price.
+Bulk discount tiers:
+  - Order total under $50:    0% discount
+  - $50 to $199:              5% discount
+  - $200 to $999:             10% discount
+  - $1,000 or more:           15% discount
+DO NOT skip this step. DO NOT guess prices. You MUST wait for quoting_agent's response.
 
-STEP 3 — FINALIZE SALE
-Since all incoming requests are purchase orders, call sales_agent to record the transaction.
-Pass the exact item name, quantity, final total price (after discount), and request date.
-transaction_type must be exactly 'sales'.
+STEP 3 - CALL sales_agent (REQUIRED after quoting_agent responds)
+Ask sales_agent to: record the transaction using the exact item name, quantity, final \
+discounted total price, and the request date. transaction_type must be exactly 'sales'.
+You MUST call sales_agent and receive a transaction confirmation BEFORE writing your \
+final answer. DO NOT say "I will finalize" - actually call sales_agent now.
 
-STEP 4 — COMPOSE CUSTOMER RESPONSE
-Write a clear, professional, friendly response that includes ALL of the following:
-  - Whether the order can be fulfilled (and a plain-language reason if not)
-  - The item(s), quantity, unit price, discount applied, and total price
+STEP 4 - WRITE final_answer
+Only after completing the above steps, write a clear, professional, friendly response \
+that includes ALL of the following:
+  - Whether the order is fulfilled or not, and the reason
+  - Item name, quantity ordered, unit price, discount percentage, and total price
   - Estimated delivery date
-  - Transaction confirmation (if a sale was completed)
-Do NOT expose database IDs, raw error messages, internal profit margins, or agent names.
-If an item is unavailable, apologize and suggest checking with us for alternatives.
+  - Transaction confirmation number (if a sale was completed in STEP 3)
+Do NOT reveal internal database IDs, raw error messages, profit margins, or agent names.
+For unavailable items, apologize and suggest contacting us for alternatives.
 
 Customer request:
 {request_text}
